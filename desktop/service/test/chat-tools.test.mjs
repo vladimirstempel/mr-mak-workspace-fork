@@ -7,7 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { createService } from '../server.mjs';
 import { terminalCommand } from '../agents.mjs';
-import { CHAT_TOOL_SERVER, chatToolArguments, chatToolEnvironment, chatToolScript } from '../chat-tools.mjs';
+import { CHAT_TOOL_SERVER, chatToolArguments, chatToolEnvironment, chatToolScript, globalChatToolFiles, opencodeChatToolConfig } from '../chat-tools.mjs';
 
 test('Codex and Claude chats start with the chat tool server; other agents do not', async () => {
   const codex = chatToolArguments('codex');
@@ -25,6 +25,16 @@ test('Codex and Claude chats start with the chat tool server; other agents do no
   const resumed = terminalCommand('codex', { resumeId: 'abc', initialPrompt: undefined, chatTools: codex }).args;
   assert.deepEqual(resumed.slice(0, 2), ['resume', 'abc']);
   assert.throws(() => terminalCommand('codex', { chatTools: [1] }), /strings/);
+});
+
+test('OpenCode gets the chat tool server with its environment and keeps its own configuration', () => {
+  const environment = { MRMAK_CHAT_URL: 'http://127.0.0.1:1', MRMAK_CHAT_ID: 'id', MRMAK_CHAT_KEY: 'key' };
+  const v2 = JSON.parse(opencodeChatToolConfig(JSON.stringify({ plugins: ['mrmak'], mcp: { servers: { docs: { type: 'remote' } } } }), 2, environment));
+  assert.deepEqual(v2.plugins, ['mrmak']);
+  assert.deepEqual(Object.keys(v2.mcp.servers), ['docs', CHAT_TOOL_SERVER]);
+  assert.deepEqual(v2.mcp.servers[CHAT_TOOL_SERVER], { type: 'local', command: [process.execPath, chatToolScript], environment });
+  const v1 = JSON.parse(opencodeChatToolConfig(undefined, 1, environment));
+  assert.deepEqual(v1.mcp[CHAT_TOOL_SERVER], { type: 'local', command: [process.execPath, chatToolScript], environment, enabled: true });
 });
 
 async function fixture() {
@@ -97,7 +107,7 @@ test('a chat lists, messages, waits for and opens other chats through its MCP se
     const child = sessions.get(opened.opened.id);
     assert.equal(child.cwd, sessions.get(lead.id).cwd); assert.equal(child.effort, 'high'); assert.equal(child.bypass, false);
     assert.match((await call(client, 'open_chat', { agent: 'codex', name: 'New chat' })).error, /descriptive English task title/);
-    assert.match((await call(client, 'open_chat', { agent: 'kimi', name: 'Map Layout Pass' })).error, /Codex or Claude/);
+    assert.match((await call(client, 'open_chat', { agent: 'shell', name: 'Map Layout Pass' })).error, /Choose Codex, Claude Code/);
   } finally { for (const client of clients) await client.close(); await service.close(); }
 });
 
@@ -114,5 +124,44 @@ test('a chat key identifies one open chat, never the service token or another ch
     assert.equal((await post('')).status, 401);
     await service.sessions.remove(lead.id);
     assert.equal((await post(`Bearer ${lead.id}.${own.MRMAK_CHAT_KEY}`)).status, 403);
+  } finally { await service.close(); }
+});
+
+test('Settings adds and removes the server in the Antigravity and Kimi files without touching other entries', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'mrmak-chat-tools-home-'));
+  const files = globalChatToolFiles({ home, env: { KIMI_CODE_HOME: path.join(home, 'kimi-home') } });
+  assert.equal(files.kimi, path.join(home, 'kimi-home', 'mcp.json'));
+  await mkdir(path.dirname(files.antigravity), { recursive: true });
+  // Antigravity leaves an empty file before its first server is added.
+  await writeFile(files.antigravity, '');
+  await mkdir(path.dirname(files.kimi), { recursive: true });
+  await writeFile(files.kimi, JSON.stringify({ mcpServers: { docs: { url: 'https://example.test/mcp' } }, other: true }));
+  const repo = await mkdtemp(path.join(os.tmpdir(), 'mrmak-chat-tools-settings-'));
+  await mkdir(path.join(repo, 'workspace'));
+  await writeFile(path.join(repo, 'workspace/workspace.json'), '{"entities":[]}');
+  const service = await createService({ repo, uiDir: repo, mcpOptions: { home: repo, env: {} }, chatToolOptions: { home, env: { KIMI_CODE_HOME: path.join(home, 'kimi-home') } } });
+  const request = (data) => fetch(service.origin + '/api/chat-tools', { method: data ? 'POST' : 'GET', headers: { Authorization: `Bearer ${service.token}`, 'Content-Type': 'application/json' }, body: data && JSON.stringify(data) }).then(async response => ({ status: response.status, body: await response.json() }));
+  const server = { command: process.execPath, args: [chatToolScript] };
+  try {
+    assert.deepEqual(Object.values((await request()).body).map(item => item.state), ['off', 'off']);
+    assert.deepEqual(Object.values((await request({ connected: true })).body).map(item => item.state), ['connected', 'connected']);
+    assert.deepEqual(JSON.parse(await readFile(files.antigravity, 'utf8')), { mcpServers: { [CHAT_TOOL_SERVER]: server } });
+    assert.deepEqual(JSON.parse(await readFile(files.kimi, 'utf8')), { mcpServers: { docs: { url: 'https://example.test/mcp' }, [CHAT_TOOL_SERVER]: server }, other: true });
+
+    // An entry from a moved installation is reported, and connecting repairs it.
+    await writeFile(files.antigravity, JSON.stringify({ mcpServers: { [CHAT_TOOL_SERVER]: { command: 'node', args: ['/old/chat-mcp.mjs'] } } }));
+    assert.equal((await request()).body.antigravity.state, 'stale');
+
+    // A broken file is never replaced, and the other file is not changed either.
+    await writeFile(files.kimi, '{ broken');
+    const refused = await request({ connected: false });
+    assert.equal(refused.status, 400); assert.match(refused.body.error, /Fix the JSON/);
+    assert.equal(JSON.parse(await readFile(files.antigravity, 'utf8')).mcpServers[CHAT_TOOL_SERVER].command, 'node');
+    assert.equal((await request()).body.kimi.state, 'error');
+
+    await writeFile(files.kimi, JSON.stringify({ mcpServers: { docs: {}, [CHAT_TOOL_SERVER]: server } }));
+    assert.deepEqual(Object.values((await request({ connected: false })).body).map(item => item.state), ['off', 'off']);
+    assert.deepEqual(JSON.parse(await readFile(files.kimi, 'utf8')), { mcpServers: { docs: {} } });
+    assert.equal((await request({ connected: 'yes' })).status, 400);
   } finally { await service.close(); }
 });

@@ -34,11 +34,11 @@ import { LocalReadAloud } from './local-read-aloud.mjs';
 import { Handoffs } from './handoff.mjs';
 import { chatCommands } from './chat-commands.mjs';
 import { isThemePreference } from './appearance.mjs';
-import { ChatTools, writeClaudeChatToolConfig } from './chat-tools.mjs';
+import { ChatTools, globalChatToolFiles, globalChatToolStatus, setGlobalChatTools, writeClaudeChatToolConfig } from './chat-tools.mjs';
 
 const listen = server => new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}`)); });
 
-export async function createService({ repo, uiDir, stateDir, token = secret(), native = () => {}, restoreSessions = false, mcpOptions, mobileOptions }) {
+export async function createService({ repo, uiDir, stateDir, token = secret(), native = () => {}, restoreSessions = false, mcpOptions, mobileOptions, chatToolOptions }) {
   repo = await realpath(repo);
   stateDir ||= path.join(repo, '.mrmak');
   const dictation = mobileOptions?.dictation || new MobileDictation(repo);
@@ -162,6 +162,9 @@ export async function createService({ repo, uiDir, stateDir, token = secret(), n
     },
   }).init();
   const chatTools = new ChatTools({ token, sessions, transcripts, settings: () => settings });
+  const chatToolFiles = globalChatToolFiles(chatToolOptions);
+  // A connected installation keeps the global entries pointing at itself after an update or move.
+  if (settings.globalChatTools === true) await setGlobalChatTools(true, chatToolFiles).catch(() => {});
   const quick = await new QuickActions({ stateDir, workspace, context: () => ({ chats: sessions.active(), route: workspaceRoute }), execute: (...args) => coordinator.execute(...args), completed: operation => broadcast('coordinator-result', { operation }) }).init();
   const askMak = async data => {
     if (coordinator.operationPromises.has(data.id) || coordinator.operations.has(data.id)) return coordinator.ask(data);
@@ -312,6 +315,13 @@ export async function createService({ repo, uiDir, stateDir, token = secret(), n
         if (method === 'POST' && url.pathname === '/api/files/markdown') {
           const preview = await files.saveMarkdown(data); await integrations.publish('artifact', { kind: 'updated', path: preview.path, name: preview.name }); broadcast('workspace-changed', {});
           return json(response, 200, preview);
+        }
+        if (method === 'GET' && url.pathname === '/api/chat-tools') return json(response, 200, await globalChatToolStatus(chatToolFiles));
+        if (method === 'POST' && url.pathname === '/api/chat-tools') {
+          if (typeof data.connected !== 'boolean') throw Object.assign(new Error('Choose whether to connect chat tools.'), { status: 400 });
+          const status = await setGlobalChatTools(data.connected, chatToolFiles);
+          settings.globalChatTools = data.connected; await saveSettings();
+          return json(response, 200, status);
         }
         if (method === 'POST' && url.pathname === '/api/settings') {
           if (inventory().some(item => item.id === data.defaultAgent)) settings.defaultAgent = data.defaultAgent;
