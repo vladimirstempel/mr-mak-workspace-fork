@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { equalSecret, saveJson } from './util.mjs';
 import { taskTitle } from './titles.mjs';
+import { antigravityConversationFile, readAntigravityTurn, validAntigravityId } from './antigravity.mjs';
 
 // Agent chats can see and message each other through a small stdio MCP server
 // (chat-mcp.mjs). Each chat proves its identity with a key derived from the
@@ -146,6 +147,10 @@ export class ChatTools {
   }
 
   async lastReply(session) {
+    if (session.agent === 'antigravity') {
+      const turn = validAntigravityId(session.nativeId) ? await readAntigravityTurn(antigravityConversationFile(session.nativeId)).catch(() => null) : null;
+      return turn?.kind === 'turn-completed' ? turn.reply.slice(-12000) : null;
+    }
     const { messages = [] } = await this.transcripts.read(session).catch(() => ({}));
     const reply = messages.findLast(item => item.role === 'assistant');
     return reply ? reply.text.slice(-12000) : null;
