@@ -14,6 +14,7 @@ import { defaultWorkerEffort, workerEfforts } from './effort.mjs';
 import { ptyOptions } from './platform.mjs';
 import { opencodeVersion, opencodeEnvironment, readOpencodeState, watchOpencode } from './opencode.mjs';
 import { prepareAntigravityLog, readAntigravityConversation, validAntigravityId, watchAntigravity } from './antigravity.mjs';
+import { CHAT_TOOL_AGENTS, chatToolArguments, chatToolEnvironment } from './chat-tools.mjs';
 
 const { Terminal } = headless;
 // Native CLIs record getcwd(): symlinks resolved (/tmp -> /private/tmp, cloud
@@ -49,6 +50,8 @@ export class Sessions extends EventEmitter {
     this.saveChain = Promise.resolve();
     this.dirty = false;
     this.closed = false;
+    // { url, token, claudeConfig } once the service listens; agent chats then get chat tools.
+    this.chatTools = null;
   }
 
   async init() {
@@ -179,7 +182,9 @@ export class Sessions extends EventEmitter {
     const antigravityLog = session.agent === 'antigravity' ? await prepareAntigravityLog(this.stateDir, session.id) : undefined;
     const noDaemon = session.agent === 'codex' && await codexSupportsNoDaemon(env);
     if (this.closed || !session.open) throw new Error('The chat was closed before its terminal started.');
-    const command = terminalCommand(session.agent, { bypass: session.bypass, resumeId, nativeId: session.nativeId, effort: session.effort, opencodeMajor, antigravityLog, noDaemon, ...first });
+    const chatTools = CHAT_TOOL_AGENTS.includes(session.agent) ? this.chatTools : null;
+    if (chatTools) Object.assign(env, chatToolEnvironment({ url: chatTools.url, token: chatTools.token, id: session.id }));
+    const command = terminalCommand(session.agent, { bypass: session.bypass, resumeId, nativeId: session.nativeId, effort: session.effort, opencodeMajor, antigravityLog, noDaemon, chatTools: chatTools ? chatToolArguments(session.agent, chatTools) : undefined, ...first });
     if (session.agent === 'codex') env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE = `mrmak_chat_${session.id}`;
     if (session.terminal) this.resetTerminal(session);
     const proc = pty.spawn(command.file, command.args, ptyOptions({ cwd: session.cwd, env, cols: session.cols, rows: session.rows }));
